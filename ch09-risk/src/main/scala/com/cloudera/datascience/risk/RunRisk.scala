@@ -8,10 +8,10 @@ package com.cloudera.datascience.risk
 
 import java.io.File
 import java.text.SimpleDateFormat
+import java.time.ZonedDateTime
 import java.util.Locale
 
 import scala.collection.mutable.ArrayBuffer
-import scala.io.Source
 
 import org.apache.spark.{SparkConf, SparkContext}
 import org.apache.spark.SparkContext._
@@ -26,8 +26,6 @@ import org.apache.commons.math3.distribution.MultivariateNormalDistribution
 import org.apache.commons.math3.random.MersenneTwister
 import org.apache.commons.math3.stat.correlation.Covariance
 import org.apache.commons.math3.stat.regression.OLSMultipleLinearRegression
-
-import org.joda.time.DateTime
 
 object RunRisk {
   def main(args: Array[String]): Unit = {
@@ -89,22 +87,82 @@ object RunRisk {
     squaredReturns ++ squareRootedReturns ++ factorReturns
   }
 
-  def readStocksAndFactors(prefix: String): (Seq[Array[Double]], Seq[Array[Double]]) = {
-    val start = new DateTime(2009, 10, 23, 0, 0)
-    val end = new DateTime(2014, 10, 23, 0, 0)
+  /**
+   * Reads a history in the Yahoo format
+   */
+  def readYahooHistory(file: File): Array[(ZonedDateTime, Double)] = {
+    val format = new SimpleDateFormat("yyyy-MM-dd", Locale.ENGLISH)
+    val lines = scala.io.Source.fromFile(file).getLines().toSeq
+    lines.tail.map { line =>
+      val cols = line.split(',')
+      val date = new ZonedDateTime(format.parse(cols(0)))
+      val value = cols(1).toDouble
+      (date, value)
+    }.reverse.toArray
+  }
 
-    val rawStocks = readHistories(new File(prefix + "data/stocks/")).filter(_.size >= 260*5+10)
+  def readHistories(dir: File): Seq[Array[(ZonedDateTime, Double)]] = {
+    val files = dir.listFiles()
+    files.flatMap { file =>
+      try {
+        Some(readYahooHistory(file))
+      } catch {
+        case e: Exception => None
+      }
+    }
+  }
+
+  def trimToRegion(history: Array[(ZonedDateTime, Double)], start: ZonedDateTime, end: ZonedDateTime)
+    : Array[(ZonedDateTime, Double)] = {
+    var trimmed = history.dropWhile(_._1.isBefore(start)).takeWhile(x => x._1.isBefore(end) || x._1.isEqual(end))
+    if (trimmed.head._1 != start) {
+      trimmed = Array((start, trimmed.head._2)) ++ trimmed
+    }
+    if (trimmed.last._1 != end) {
+      trimmed = trimmed ++ Array((end, trimmed.last._2))
+    }
+    trimmed
+  }
+
+  /**
+   * Given a timeseries of values of an instruments, returns a timeseries between the given
+   * start and end dates with all missing weekdays imputed. Values are imputed as the value on the
+   * most recent previous given day.
+   */
+  def fillInHistory(history: Array[(ZonedDateTime, Double)], start: ZonedDateTime, end: ZonedDateTime)
+    : Array[(ZonedDateTime, Double)] = {
+    var cur = history
+    val filled = new ArrayBuffer[(ZonedDateTime, Double)]()
+    var curDate = start
+    while (curDate.isBefore(end)) {
+      if (cur.tail.nonEmpty && cur.tail.head._1 == curDate) {
+        cur = cur.tail
+      }
+
+      filled += ((curDate, cur.head._2))
+
+      curDate = curDate.plusDays(1)
+      // Skip weekends
+      if (curDate.getDayOfWeek.getValue > 5) {
+        curDate = curDate.plusDays(2)
+      }
+    }
+    filled.toArray
+  }
+
+  def readStocksAndFactors(prefix: String): (Seq[Array[Double]], Seq[Array[Double]]) = {
+    val start = new ZonedDateTime(2009, 10, 23, 0, 0)
+    val end = new ZonedDateTime(2014, 10, 23, 0, 0)
+
+    val rawStocks = readHistories(new File(prefix + "data/stocks/")).filter(_.size >= 260 * 5 + 10)
     val stocks = rawStocks.map(trimToRegion(_, start, end)).map(fillInHistory(_, start, end))
 
     val factorsPrefix = prefix + "data/factors/"
-    val factors1 = Array("crudeoil.tsv", "us30yeartreasurybonds.tsv").
-      map(x => new File(factorsPrefix + x)).
-      map(readInvestingDotComHistory)
-    val factors2 = Array("^GSPC.csv", "^IXIC.csv").
+    val rawFactors = Array("^GSPC.csv", "^IXIC.csv", "^TYX", "^FVX").
       map(x => new File(factorsPrefix + x)).
       map(readYahooHistory)
 
-    val factors = (factors1 ++ factors2).
+    val factors = rawFactors.
       map(trimToRegion(_, start, end)).
       map(fillInHistory(_, start, end))
 
@@ -156,7 +214,7 @@ object RunRisk {
     instrumentTrialReturn
   }
 
-  def twoWeekReturns(history: Array[(DateTime, Double)]): Array[Double] = {
+  def twoWeekReturns(history: Array[(ZonedDateTime, Double)]): Array[Double] = {
     history.sliding(10).map { window =>
       val next = window.last._2
       val prev = window.head._2
@@ -177,78 +235,6 @@ object RunRisk {
       mat(i) = histories.map(_(i)).toArray
     }
     mat
-  }
-
-  def readHistories(dir: File): Seq[Array[(DateTime, Double)]] = {
-    val files = dir.listFiles()
-    files.flatMap(file => {
-      try {
-        Some(readYahooHistory(file))
-      } catch {
-        case e: Exception => None
-      }
-    })
-  }
-
-  def trimToRegion(history: Array[(DateTime, Double)], start: DateTime, end: DateTime)
-  : Array[(DateTime, Double)] = {
-    var trimmed = history.dropWhile(_._1 < start).takeWhile(_._1 <= end)
-    if (trimmed.head._1 != start) {
-      trimmed = Array((start, trimmed.head._2)) ++ trimmed
-    }
-    if (trimmed.last._1 != end) {
-      trimmed = trimmed ++ Array((end, trimmed.last._2))
-    }
-    trimmed
-  }
-
-  /**
-   * Given a timeseries of values of an instruments, returns a timeseries between the given
-   * start and end dates with all missing weekdays imputed. Values are imputed as the value on the
-   * most recent previous given day.
-   */
-  def fillInHistory(history: Array[(DateTime, Double)], start: DateTime, end: DateTime)
-  : Array[(DateTime, Double)] = {
-    var cur = history
-    val filled = new ArrayBuffer[(DateTime, Double)]()
-    var curDate = start
-    while (curDate < end) {
-      if (cur.tail.nonEmpty && cur.tail.head._1 == curDate) {
-        cur = cur.tail
-      }
-
-      filled += ((curDate, cur.head._2))
-
-      curDate += 1.days
-      // Skip weekends
-      if (curDate.dayOfWeek().get > 5) curDate += 2.days
-    }
-    filled.toArray
-  }
-
-  def readInvestingDotComHistory(file: File): Array[(DateTime, Double)] = {
-    val format = new SimpleDateFormat("MMM d, yyyy", Locale.ENGLISH)
-    val lines = Source.fromFile(file).getLines().toSeq
-    lines.map(line => {
-      val cols = line.split('\t')
-      val date = new DateTime(format.parse(cols(0)))
-      val value = cols(1).toDouble
-      (date, value)
-    }).reverse.toArray
-  }
-
-  /**
-   * Reads a history in the Yahoo format
-   */
-  def readYahooHistory(file: File): Array[(DateTime, Double)] = {
-    val format = new SimpleDateFormat("yyyy-MM-dd", Locale.ENGLISH)
-    val lines = Source.fromFile(file).getLines().toSeq
-    lines.tail.map(line => {
-      val cols = line.split(',')
-      val date = new DateTime(format.parse(cols(0)))
-      val value = cols(1).toDouble
-      (date, value)
-    }).reverse.toArray
   }
 
   def plotDistribution(samples: Array[Double]): Figure = {
