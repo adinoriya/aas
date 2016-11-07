@@ -11,9 +11,10 @@ import java.time.LocalDate
 import java.time.format.DateTimeFormatter
 
 import scala.collection.mutable.ArrayBuffer
-import org.apache.spark.{SparkConf, SparkContext}
-import org.apache.spark.SparkContext._
-import org.apache.spark.rdd.RDD
+import org.apache.spark.mllib.stat.KernelDensity
+import org.apache.spark.sql.{Dataset, SparkSession}
+import org.apache.spark.sql.functions.{count, stddev_pop}
+import org.apache.spark.util.StatCounter
 import breeze.plot._
 import org.apache.commons.math3.distribution.ChiSquaredDistribution
 import org.apache.commons.math3.distribution.MultivariateNormalDistribution
@@ -21,28 +22,39 @@ import org.apache.commons.math3.random.MersenneTwister
 import org.apache.commons.math3.stat.correlation.Covariance
 import org.apache.commons.math3.stat.regression.OLSMultipleLinearRegression
 
+
 object RunRisk {
   def main(args: Array[String]): Unit = {
-    val sc = new SparkContext(new SparkConf().setAppName("VaR"))
-    val (stocksReturns, factorsReturns) = readStocksAndFactors()
-    plotDistribution(factorsReturns(2))
-    plotDistribution(factorsReturns(3))
+    val spark = SparkSession.builder().getOrCreate()
+    val runRisk = new RunRisk(spark)
+
+    val (stocksReturns, factorsReturns) = runRisk.readStocksAndFactors()
+    runRisk.plotDistribution(factorsReturns(2))
+    runRisk.plotDistribution(factorsReturns(3))
+
     val numTrials = 10000000
     val parallelism = 1000
     val baseSeed = 1001L
-    val trials = computeTrialReturns(stocksReturns, factorsReturns, sc, baseSeed, numTrials, parallelism)
+    val trials = runRisk.computeTrialReturns(stocksReturns, factorsReturns, baseSeed, numTrials,
+      parallelism)
     trials.cache()
-    val valueAtRisk = fivePercentVaR(trials)
-    val conditionalValueAtRisk = fivePercentCVaR(trials)
+    val valueAtRisk = runRisk.fivePercentVaR(trials)
+    val conditionalValueAtRisk = runRisk.fivePercentCVaR(trials)
     println("VaR 5%: " + valueAtRisk)
     println("CVaR 5%: " + conditionalValueAtRisk)
-    val varConfidenceInterval = bootstrappedConfidenceInterval(trials, fivePercentVaR, 100, .05)
-    val cvarConfidenceInterval = bootstrappedConfidenceInterval(trials, fivePercentCVaR, 100, .05)
+    val varConfidenceInterval = runRisk.bootstrappedConfidenceInterval(trials,
+      runRisk.fivePercentVaR, 100, .05)
+    val cvarConfidenceInterval = runRisk.bootstrappedConfidenceInterval(trials,
+      runRisk.fivePercentCVaR, 100, .05)
     println("VaR confidence interval: " + varConfidenceInterval)
     println("CVaR confidence interval: " + cvarConfidenceInterval)
-    println("Kupiec test p-value: " + kupiecTestPValue(stocksReturns, valueAtRisk, 0.05))
-    plotDistribution(trials)
+    println("Kupiec test p-value: " + runRisk.kupiecTestPValue(stocksReturns, valueAtRisk, 0.05))
+    runRisk.plotDistribution(trials)
   }
+}
+
+class RunRisk(private val spark: SparkSession) {
+  import spark.implicits._
 
   /**
    * Reads a history in the Yahoo format
@@ -60,7 +72,8 @@ object RunRisk {
 
   def trimToRegion(history: Array[(LocalDate, Double)], start: LocalDate, end: LocalDate)
     : Array[(LocalDate, Double)] = {
-    var trimmed = history.dropWhile(_._1.isBefore(start)).takeWhile(x => x._1.isBefore(end) || x._1.isEqual(end))
+    var trimmed = history.dropWhile(_._1.isBefore(start)).
+      takeWhile(x => x._1.isBefore(end) || x._1.isEqual(end))
     if (trimmed.head._1 != start) {
       trimmed = Array((start, trimmed.head._2)) ++ trimmed
     }
@@ -175,7 +188,7 @@ object RunRisk {
     val trialReturns = new Array[Double](numTrials)
     for (i <- 0 until numTrials) {
       val trialFactorReturns = multivariateNormal.sample()
-      val trialFeatures = RunRisk.featurize(trialFactorReturns)
+      val trialFeatures = featurize(trialFactorReturns)
       trialReturns(i) = trialReturn(trialFeatures, instruments)
     }
     trialReturns
@@ -208,9 +221,15 @@ object RunRisk {
   def plotDistribution(samples: Array[Double]): Figure = {
     val min = samples.min
     val max = samples.max
+    val stddev = new StatCounter(samples).stdev
+    val bandwidth = 1.06 * stddev * math.pow(samples.size, -.2)
+
     // Using toList before toArray avoids a Scala bug
     val domain = Range.Double(min, max, (max - min) / 100).toList.toArray
-    val densities = KernelDensity.estimate(samples, domain)
+    val kd = new KernelDensity().
+      setSample(samples.toSeq.toDS.rdd).
+      setBandwidth(bandwidth)
+    val densities = kd.estimate(domain)
     val f = Figure()
     val p = f.subplot(0)
     p += plot(domain, densities)
@@ -219,13 +238,20 @@ object RunRisk {
     f
   }
 
-  def plotDistribution(samples: RDD[Double]): Figure = {
-    val stats = samples.stats()
-    val min = stats.min
-    val max = stats.max
+  def plotDistribution(samples: Dataset[Double]): Figure = {
+    val stats = samples.agg(org.apache.spark.sql.functions.min($"value"), org.apache.spark.sql.functions.max($"value"), org.apache.spark.sql.functions.count($"value"), stddev_pop($"value")).first()
+    val min = stats(0).asInstanceOf[Double]
+    val max = stats(1).asInstanceOf[Double]
+    val count = stats(2).asInstanceOf[Long]
+    val stddev = stats(3).asInstanceOf[Double]
+    val bandwidth = 1.06 * stddev * math.pow(count, -.2)
+
     // Using toList before toArray avoids a Scala bug
     val domain = Range.Double(min, max, (max - min) / 100).toList.toArray
-    val densities = KernelDensity.estimate(samples, domain)
+    val kd = new KernelDensity().
+      setSample(samples.rdd).
+      setBandwidth(bandwidth)
+    val densities = kd.estimate(domain)
     val f = Figure()
     val p = f.subplot(0)
     p += plot(domain, densities)
@@ -234,27 +260,27 @@ object RunRisk {
     f
   }
 
-  def fivePercentVaR(trials: RDD[Double]): Double = {
-    val topLosses = trials.takeOrdered(math.max(trials.count().toInt / 20, 1))
-    topLosses.last
+  def fivePercentVaR(trials: Dataset[Double]): Double = {
+    val quantiles = trials.stat.approxQuantile("value", Array(0.05), 0.0)
+    quantiles(0)
   }
 
-  def fivePercentCVaR(trials: RDD[Double]): Double = {
-    val topLosses = trials.takeOrdered(math.max(trials.count().toInt / 20, 1))
-    topLosses.sum / topLosses.length
+  def fivePercentCVaR(trials: Dataset[Double]): Double = {
+    val topLosses = trials.orderBy("value").limit(math.max(trials.count().toInt / 20, 1))
+    topLosses.agg("value" -> "avg").first()(0).asInstanceOf[Double]
   }
 
   def bootstrappedConfidenceInterval(
-      trials: RDD[Double],
-      computeStatistic: RDD[Double] => Double,
+      trials: Dataset[Double],
+      computeStatistic: Dataset[Double] => Double,
       numResamples: Int,
-      pValue: Double): (Double, Double) = {
+      probability: Double): (Double, Double) = {
     val stats = (0 until numResamples).map { i =>
       val resample = trials.sample(true, 1.0)
       computeStatistic(resample)
     }.sorted
-    val lowerIndex = (numResamples * pValue / 2 - 1).toInt
-    val upperIndex = math.ceil(numResamples * (1 - pValue / 2)).toInt
+    val lowerIndex = (numResamples * probability / 2 - 1).toInt
+    val upperIndex = math.ceil(numResamples * (1 - probability / 2)).toInt
     (stats(lowerIndex), stats(upperIndex))
   }
 
@@ -291,24 +317,20 @@ object RunRisk {
   def computeTrialReturns(
       stocksReturns: Seq[Array[Double]],
       factorsReturns: Seq[Array[Double]],
-      sc: SparkContext,
       baseSeed: Long,
       numTrials: Int,
-      parallelism: Int): RDD[Double] = {
+      parallelism: Int): Dataset[Double] = {
     val factorMat = factorMatrix(factorsReturns)
     val factorCov = new Covariance(factorMat).getCovarianceMatrix().getData()
     val factorMeans = factorsReturns.map(factor => factor.sum / factor.size).toArray
     val factorFeatures = factorMat.map(featurize)
     val factorWeights = computeFactorWeights(stocksReturns, factorFeatures)
 
-    val bInstruments = sc.broadcast(factorWeights)
-
     // Generate different seeds so that our simulations don't all end up with the same results
     val seeds = (baseSeed until baseSeed + parallelism)
-    val seedRdd = sc.parallelize(seeds, parallelism)
+    val seedDS = seeds.toDS().repartition(parallelism)
 
     // Main computation: run simulations and compute aggregate return for each
-    seedRdd.flatMap(
-      trialReturns(_, numTrials / parallelism, bInstruments.value, factorMeans, factorCov))
+    seedDS.flatMap(trialReturns(_, numTrials / parallelism, factorWeights, factorMeans, factorCov))
   }
 }
