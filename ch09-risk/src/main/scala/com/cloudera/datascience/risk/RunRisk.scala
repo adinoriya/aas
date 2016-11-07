@@ -7,20 +7,14 @@
 package com.cloudera.datascience.risk
 
 import java.io.File
-import java.text.SimpleDateFormat
-import java.time.ZonedDateTime
-import java.util.Locale
+import java.time.LocalDate
+import java.time.format.DateTimeFormatter
 
 import scala.collection.mutable.ArrayBuffer
-
 import org.apache.spark.{SparkConf, SparkContext}
 import org.apache.spark.SparkContext._
 import org.apache.spark.rdd.RDD
-
 import breeze.plot._
-
-import com.github.nscala_time.time.Implicits._
-
 import org.apache.commons.math3.distribution.ChiSquaredDistribution
 import org.apache.commons.math3.distribution.MultivariateNormalDistribution
 import org.apache.commons.math3.random.MersenneTwister
@@ -30,14 +24,13 @@ import org.apache.commons.math3.stat.regression.OLSMultipleLinearRegression
 object RunRisk {
   def main(args: Array[String]): Unit = {
     val sc = new SparkContext(new SparkConf().setAppName("VaR"))
-    val (stocksReturns, factorsReturns) = readStocksAndFactors("./")
+    val (stocksReturns, factorsReturns) = readStocksAndFactors()
     plotDistribution(factorsReturns(2))
     plotDistribution(factorsReturns(3))
     val numTrials = 10000000
     val parallelism = 1000
     val baseSeed = 1001L
-    val trials = computeTrialReturns(stocksReturns, factorsReturns, sc, baseSeed, numTrials,
-      parallelism)
+    val trials = computeTrialReturns(stocksReturns, factorsReturns, sc, baseSeed, numTrials, parallelism)
     trials.cache()
     val valueAtRisk = fivePercentVaR(trials)
     val conditionalValueAtRisk = fivePercentCVaR(trials)
@@ -51,69 +44,22 @@ object RunRisk {
     plotDistribution(trials)
   }
 
-  def computeTrialReturns(
-      stocksReturns: Seq[Array[Double]],
-      factorsReturns: Seq[Array[Double]],
-      sc: SparkContext,
-      baseSeed: Long,
-      numTrials: Int,
-      parallelism: Int): RDD[Double] = {
-    val factorMat = factorMatrix(factorsReturns)
-    val factorCov = new Covariance(factorMat).getCovarianceMatrix().getData()
-    val factorMeans = factorsReturns.map(factor => factor.sum / factor.size).toArray
-    val factorFeatures = factorMat.map(featurize)
-    val factorWeights = computeFactorWeights(stocksReturns, factorFeatures)
-
-    val bInstruments = sc.broadcast(factorWeights)
-
-    // Generate different seeds so that our simulations don't all end up with the same results
-    val seeds = (baseSeed until baseSeed + parallelism)
-    val seedRdd = sc.parallelize(seeds, parallelism)
-
-    // Main computation: run simulations and compute aggregate return for each
-    seedRdd.flatMap(
-      trialReturns(_, numTrials / parallelism, bInstruments.value, factorMeans, factorCov))
-  }
-
-  def computeFactorWeights(
-      stocksReturns: Seq[Array[Double]],
-      factorFeatures: Array[Array[Double]]): Array[Array[Double]] = {
-    stocksReturns.map(linearModel(_, factorFeatures)).map(_.estimateRegressionParameters()).toArray
-  }
-
-  def featurize(factorReturns: Array[Double]): Array[Double] = {
-    val squaredReturns = factorReturns.map(x => math.signum(x) * x * x)
-    val squareRootedReturns = factorReturns.map(x => math.signum(x) * math.sqrt(math.abs(x)))
-    squaredReturns ++ squareRootedReturns ++ factorReturns
-  }
-
   /**
    * Reads a history in the Yahoo format
    */
-  def readYahooHistory(file: File): Array[(ZonedDateTime, Double)] = {
-    val format = new SimpleDateFormat("yyyy-MM-dd", Locale.ENGLISH)
+  def readYahooHistory(file: File): Array[(LocalDate, Double)] = {
+    val formatter = DateTimeFormatter.ofPattern("yyyy-MM-dd")
     val lines = scala.io.Source.fromFile(file).getLines().toSeq
     lines.tail.map { line =>
       val cols = line.split(',')
-      val date = new ZonedDateTime(format.parse(cols(0)))
+      val date = LocalDate.parse(cols(0), formatter)
       val value = cols(1).toDouble
       (date, value)
     }.reverse.toArray
   }
 
-  def readHistories(dir: File): Seq[Array[(ZonedDateTime, Double)]] = {
-    val files = dir.listFiles()
-    files.flatMap { file =>
-      try {
-        Some(readYahooHistory(file))
-      } catch {
-        case e: Exception => None
-      }
-    }
-  }
-
-  def trimToRegion(history: Array[(ZonedDateTime, Double)], start: ZonedDateTime, end: ZonedDateTime)
-    : Array[(ZonedDateTime, Double)] = {
+  def trimToRegion(history: Array[(LocalDate, Double)], start: LocalDate, end: LocalDate)
+    : Array[(LocalDate, Double)] = {
     var trimmed = history.dropWhile(_._1.isBefore(start)).takeWhile(x => x._1.isBefore(end) || x._1.isEqual(end))
     if (trimmed.head._1 != start) {
       trimmed = Array((start, trimmed.head._2)) ++ trimmed
@@ -129,10 +75,10 @@ object RunRisk {
    * start and end dates with all missing weekdays imputed. Values are imputed as the value on the
    * most recent previous given day.
    */
-  def fillInHistory(history: Array[(ZonedDateTime, Double)], start: ZonedDateTime, end: ZonedDateTime)
-    : Array[(ZonedDateTime, Double)] = {
+  def fillInHistory(history: Array[(LocalDate, Double)], start: LocalDate, end: LocalDate)
+    : Array[(LocalDate, Double)] = {
     var cur = history
-    val filled = new ArrayBuffer[(ZonedDateTime, Double)]()
+    val filled = new ArrayBuffer[(LocalDate, Double)]()
     var curDate = start
     while (curDate.isBefore(end)) {
       if (cur.tail.nonEmpty && cur.tail.head._1 == curDate) {
@@ -150,25 +96,70 @@ object RunRisk {
     filled.toArray
   }
 
-  def readStocksAndFactors(prefix: String): (Seq[Array[Double]], Seq[Array[Double]]) = {
-    val start = new ZonedDateTime(2009, 10, 23, 0, 0)
-    val end = new ZonedDateTime(2014, 10, 23, 0, 0)
+  def twoWeekReturns(history: Array[(LocalDate, Double)]): Array[Double] = {
+    history.sliding(10).map { window =>
+      val next = window.last._2
+      val prev = window.head._2
+      (next - prev) / prev
+    }.toArray
+  }
 
-    val rawStocks = readHistories(new File(prefix + "data/stocks/")).filter(_.size >= 260 * 5 + 10)
-    val stocks = rawStocks.map(trimToRegion(_, start, end)).map(fillInHistory(_, start, end))
+  def readStocksAndFactors(): (Seq[Array[Double]], Seq[Array[Double]]) = {
+    val start = LocalDate.of(2009, 10, 23)
+    val end = LocalDate.of(2014, 10, 23)
 
-    val factorsPrefix = prefix + "data/factors/"
-    val rawFactors = Array("^GSPC.csv", "^IXIC.csv", "^TYX", "^FVX").
+    val stocksDir = new File("stocks/")
+    val files = stocksDir.listFiles()
+    val allStocks = files.iterator.flatMap { file =>
+      try {
+        Some(readYahooHistory(file))
+      } catch {
+        case e: Exception => None
+      }
+    }
+    val rawStocks = allStocks.filter(_.size >= 260 * 5 + 10)
+
+    val factorsPrefix = "factors/"
+    val rawFactors = Array("^GSPC.csv", "^IXIC.csv", "^TYX.csv", "^FVX.csv").
       map(x => new File(factorsPrefix + x)).
       map(readYahooHistory)
+
+    val stocks = rawStocks.map(trimToRegion(_, start, end)).map(fillInHistory(_, start, end))
 
     val factors = rawFactors.
       map(trimToRegion(_, start, end)).
       map(fillInHistory(_, start, end))
 
-    val stockReturns = stocks.map(twoWeekReturns)
-    val factorReturns = factors.map(twoWeekReturns)
-    (stockReturns, factorReturns)
+    val stocksReturns = stocks.map(twoWeekReturns).toArray.toSeq
+    val factorsReturns = factors.map(twoWeekReturns)
+    (stocksReturns, factorsReturns)
+  }
+
+  def factorMatrix(histories: Seq[Array[Double]]): Array[Array[Double]] = {
+    val mat = new Array[Array[Double]](histories.head.length)
+    for (i <- 0 until histories.head.length) {
+      mat(i) = histories.map(_(i)).toArray
+    }
+    mat
+  }
+
+  def featurize(factorReturns: Array[Double]): Array[Double] = {
+    val squaredReturns = factorReturns.map(x => math.signum(x) * x * x)
+    val squareRootedReturns = factorReturns.map(x => math.signum(x) * math.sqrt(math.abs(x)))
+    squaredReturns ++ squareRootedReturns ++ factorReturns
+  }
+
+  def linearModel(instrument: Array[Double], factorMatrix: Array[Array[Double]])
+    : OLSMultipleLinearRegression = {
+    val regression = new OLSMultipleLinearRegression()
+    regression.newSampleData(instrument, factorMatrix)
+    regression
+  }
+
+  def computeFactorWeights(
+    stocksReturns: Seq[Array[Double]],
+    factorFeatures: Array[Array[Double]]): Array[Array[Double]] = {
+    stocksReturns.map(linearModel(_, factorFeatures)).map(_.estimateRegressionParameters()).toArray
   }
 
   def trialReturns(
@@ -212,29 +203,6 @@ object RunRisk {
       i += 1
     }
     instrumentTrialReturn
-  }
-
-  def twoWeekReturns(history: Array[(ZonedDateTime, Double)]): Array[Double] = {
-    history.sliding(10).map { window =>
-      val next = window.last._2
-      val prev = window.head._2
-      (next - prev) / prev
-    }.toArray
-  }
-
-  def linearModel(instrument: Array[Double], factorMatrix: Array[Array[Double]])
-  : OLSMultipleLinearRegression = {
-    val regression = new OLSMultipleLinearRegression()
-    regression.newSampleData(instrument, factorMatrix)
-    regression
-  }
-
-  def factorMatrix(histories: Seq[Array[Double]]): Array[Array[Double]] = {
-    val mat = new Array[Array[Double]](histories.head.length)
-    for (i <- 0 until histories.head.length) {
-      mat(i) = histories.map(_(i)).toArray
-    }
-    mat
   }
 
   def plotDistribution(samples: Array[Double]): Figure = {
@@ -320,4 +288,27 @@ object RunRisk {
     1 - new ChiSquaredDistribution(1.0).cumulativeProbability(testStatistic)
   }
 
+  def computeTrialReturns(
+      stocksReturns: Seq[Array[Double]],
+      factorsReturns: Seq[Array[Double]],
+      sc: SparkContext,
+      baseSeed: Long,
+      numTrials: Int,
+      parallelism: Int): RDD[Double] = {
+    val factorMat = factorMatrix(factorsReturns)
+    val factorCov = new Covariance(factorMat).getCovarianceMatrix().getData()
+    val factorMeans = factorsReturns.map(factor => factor.sum / factor.size).toArray
+    val factorFeatures = factorMat.map(featurize)
+    val factorWeights = computeFactorWeights(stocksReturns, factorFeatures)
+
+    val bInstruments = sc.broadcast(factorWeights)
+
+    // Generate different seeds so that our simulations don't all end up with the same results
+    val seeds = (baseSeed until baseSeed + parallelism)
+    val seedRdd = sc.parallelize(seeds, parallelism)
+
+    // Main computation: run simulations and compute aggregate return for each
+    seedRdd.flatMap(
+      trialReturns(_, numTrials / parallelism, bInstruments.value, factorMeans, factorCov))
+  }
 }
